@@ -24,8 +24,8 @@ EMAIL     = "admin1@11plusonline.co.uk"
 PASSWORD  = "password1"
 
 # Range of question IDs to delete (inclusive). Displayed as Q#### (zero-padded).
-DEFAULT_START = 775
-DEFAULT_END   = 792
+DEFAULT_START = 3074
+DEFAULT_END   = 3096
 
 DELAY_MS = 800   # pause between deletions
 

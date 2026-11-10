@@ -31,16 +31,14 @@ from playwright.async_api import async_playwright
 
 # ── User config — only change these two lines per paper ──────────────────────
 # Valid TOPIC values: "Non Verbal Reasoning", "English", "Mathematics", "Verbal Reasoning"
-TOPIC     = "Non Verbal Reasoning"
-DOCX_PATH = r"C:\Users\angel\Documents\Exceptional Academics\ISEB\ISEB 5\NVR.docx"
-# ─────────────────────────────────────────────────────────────────────────────
-
+TOPIC     = "English"   # "Non Verbal Reasoning" | "English" | "Mathematics" | "Verbal Reasoning"
+DOCX_PATH = r"C:\Users\angel\Documents\Exceptional Academics\ISEB\ISEB 7\ENGLISH.docx"
 print(DOCX_PATH)
 print(os.path.exists(DOCX_PATH))
 
 # ── Delay between uploads (seconds) — set both to 0 to disable ───────────────
-DELAY_MIN = 45
-DELAY_MAX = 90
+DELAY_MIN = 60
+DELAY_MAX = 100
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOGIN_URL = "https://admin.11plusonline.co.uk/login"
@@ -65,6 +63,7 @@ PUNCTUATION_PROMPT = "Which part of the sentence contains a punctuation error?"
 #               "Question text, image on the right side, 5 text-based answer options"
 LAYOUT_NVR_TEXT_ANSWERS  = "text-based answer options"     # picks the text-answer NVR card
 LAYOUT_5_TEXT            = "5 text-based answer options"   # plain 5-option text card (Eng/Maths/VR)
+LAYOUT_3_TEXT            = "3 text-based answer options"   # plain 3-option text card (Eng/Maths/VR)
 LAYOUT_MATHS_IMAGE_TOP   = "image on the top, 5 text-based answer options"
 
 # ── ISEB map: TOPIC → paper-level config ─────────────────────────────────────
@@ -443,6 +442,9 @@ def parse_english(doc):
                     om = opt_re.match(part.strip())
                     if om:
                         cur["_opts"][om.group(1).upper()] = om.group(2).strip()
+                    elif part.strip() and not cur["_opts"]:
+                        # extra stem line before the options, e.g. the statement to respond to
+                        cur["question_text"] = (cur["question_text"] + "\n" + part.strip()).strip()
             continue
 
     flush_cur()
@@ -642,7 +644,18 @@ def parse_maths(doc):
 def parse_vr(doc):
     sections = {}
     current = None
-    headers = ("ODD TWO OUT", "SYNONYMS", "ANALOGIES", "WORD CODES", "ANAGRAMS")
+    headers = ("ODD TWO OUT", "SYNONYMS", "ANALOGIES", "WORD CODES", "ANAGRAMS",
+               "COMPOUND WORDS", "MOVE A LETTER", "MOVE TWO LETTERS", "FORM A WORD", "WORD MATCH",
+               "CONNECTED WORDS", "INSERT A LETTER", "RELATED WORDS",
+               "WORD COMPLETION", "WORD PAIRS", "WORD RELATIONSHIPS", "WORD OPPOSITES",
+               "EMBEDDED WORDS", "MISSING LETTERS")
+    header_set = set(headers)
+
+    def _norm_header(text):
+        # Papers vary: "MOVE 2 LETTERS" vs "MOVE TWO LETTERS", trailing ":" etc.
+        t = text.upper().strip().rstrip(":.).!")
+        return t.replace(" 2 ", " TWO ").replace(" 1 ", " ONE ")
+
     for block in iter_block_items(doc):
         if isinstance(block, Table):
             if current is not None:
@@ -652,8 +665,9 @@ def parse_vr(doc):
         t = block.text.strip()
         if not t:
             continue
-        if t.upper() in headers:
-            current = t.upper()
+        _t_norm = _norm_header(t)
+        if _t_norm in header_set:
+            current = _t_norm
             sections[current] = []
             continue
         if current is not None:
@@ -661,10 +675,36 @@ def parse_vr(doc):
 
     questions = []
     questions += _parse_vr_odd_two_out(sections.get("ODD TWO OUT", []))
-    questions += _parse_vr_synonyms(sections.get("SYNONYMS", []))
-    questions += _parse_vr_numbered(sections.get("ANALOGIES", []), "Analogies")
-    questions += _parse_vr_numbered(sections.get("WORD CODES", []), "Word Codes")
-    questions += _parse_vr_numbered(sections.get("ANAGRAMS", []), "Anagrams")
+
+    # These topics use the same numbered-question format. The option labels
+    # determine the option count, so the shared parser supports both 3- and
+    # 5-option questions (including the sample paper's Synonyms format).
+    numbered_sections = {
+        "RELATED WORDS": "Related Words",
+        "SYNONYMS": "Synonyms",
+        "WORD COMPLETION": "Word Completion",
+        "ANALOGIES": "Analogies",
+        "WORD CODES": "Word Codes",
+        "ANAGRAMS": "Anagrams",
+        "COMPOUND WORDS": "Compound Words",
+        "MOVE A LETTER": "Move a Letter",
+        "MOVE TWO LETTERS": "Move Two Letters",
+        "FORM A WORD": "Form a Word",
+        "WORD MATCH": "Word Match",
+        "CONNECTED WORDS": "Connected Words",
+        "INSERT A LETTER": "Insert a Letter",
+        "WORD PAIRS": "Word Pairs",
+        "WORD RELATIONSHIPS": "Word Relationships",
+        "WORD OPPOSITES": "Word Opposites",
+        "EMBEDDED WORDS": "Embedded Words",
+        "MISSING LETTERS": "Missing Letters",
+    }
+    # Process in the document's section order so assigned question numbers
+    # follow the paper rather than the order of parser implementation details.
+    for section, items in sections.items():
+        title = numbered_sections.get(section)
+        if title:
+            questions += _parse_vr_numbered(items, title)
 
     for i, q in enumerate(questions, start=1):
         q["num"] = i
@@ -776,57 +816,98 @@ def _parse_vr_synonyms(items):
 
 
 def _parse_vr_numbered(items, title):
-    """Shared parser for Analogies / Word Codes / Anagrams.
+    """Shared parser for numbered verbal-reasoning sections with 3 or 5 options.
 
-    Word Codes has no explicit numbering (a new stem simply follows the previous
-    Answer line); Analogies/Anagrams use 'N.' markers. Either way: one long (>80
-    char) line is the one-time section instruction; the first short line after a
-    marker/previous-answer is the stem; subsequent lines up to 'Answer:' are options.
+    Supports two formats:
+    1. Traditional: numbered marker on its own line, stem on next line, options same/following lines, Answer+Explanation on one line.
+    2. Your format: "1. Stem text" on same line as number, options on separate lines starting with A-E,
+       "Answer: X" and "Explanation: ..." on separate lines.
     """
     questions = []
     instr = ""
-    num_re = re.compile(r"^(\d+)\.?$")
+    num_re = re.compile(r"^(\d+)\.?\s*(.*)$")  # captures stem on same line
     stem = None
     opts = {}
+    pending_expl = None
+
+    def _save():
+        nonlocal stem, opts, pending_expl, instr
+        if stem is None:
+            return
+        qtext = "\n\n".join(part for part in (instr, stem) if part)
+        # Filter to only non-empty options (for 3-option layouts)
+        option_letters = [letter for letter in LETTERS if opts.get(letter)]
+        real_options = [opts[letter] for letter in option_letters]
+        n_opts = len(real_options)
+        layout = LAYOUT_3_TEXT if n_opts == 3 else LAYOUT_5_TEXT
+        correct = (
+            [option_letters.index(letter) for letter in pending_expl[0] if letter in option_letters]
+            if pending_expl else []
+        )
+        questions.append({
+            "title": title,
+            "site_topic": None,
+            "content": "text",
+            "layout": layout,
+            "question_text": qtext,
+            "options": real_options,
+            "answer": pending_expl[0] if pending_expl else "",
+            "correct": correct,
+            "explanation": pending_expl[1] if pending_expl else "",
+            "needs_manual": False,
+        })
+        stem, opts, pending_expl = None, {}, None
+
     for kind, val in items:
         if kind != "P":
             continue
-        t = val
-        if num_re.match(t):
-            stem, opts = None, {}
+        t = val.strip()
+        if not t:
             continue
+
+        # Section instruction (e.g., "Choose the word that completes the sentence...")
+        # Heuristic: long-ish sentence, no A-E option pattern, appears before any numbered Q
+        if stem is None and not opts and not num_re.match(t) and not _VR_ANS_RE.match(t) and not t.startswith("Explanation"):
+            if len(t) > 20 and " " in t:
+                instr = "\n".join(part for part in (instr, t) if part)
+            continue
+
+        # Answer line
         m_ans = _VR_ANS_RE.match(t)
         if m_ans:
             letters = m_ans.group(1).upper()
             expl = m_ans.group(2).strip()
-            options = [opts.get(l, "") for l in LETTERS]
-            correct = [LETTERS.index(c) for c in letters if c in LETTERS]
-            qtext = f"{instr}\n\n{stem}".strip() if instr else (stem or "")
-            questions.append({
-                "title": title,
-                "site_topic": None,
-                "content": "text",
-                "layout": LAYOUT_5_TEXT,
-                "question_text": qtext,
-                "options": options,
-                "answer": letters,
-                "correct": correct,
-                "explanation": expl,
-                "needs_manual": False,
-            })
-            stem, opts = None, {}
+            pending_expl = (letters, expl)
+            # If explanation is on NEXT line, we'll catch it below
             continue
-        if stem is None and not opts and _is_vr_instruction(t):
-            if not instr:
-                instr = t
+
+        # Explanation line (separate from Answer)
+        if t.startswith("Explanation"):
+            if pending_expl:
+                letters, _ = pending_expl
+                expl = t.split(":", 1)[1].strip() if ":" in t else t
+                pending_expl = (letters, expl)
             continue
-        if stem is None:
-            stem = t
+
+        # Numbered question start
+        m_num = num_re.match(t)
+        if m_num:
+            # Save previous if exists
+            _save()
+            stem = m_num.group(2).strip()
+            opts = {}
+            pending_expl = None
             continue
-        for part in t.split("\n"):
-            part = part.strip()
-            if part and part[0] in LETTERS:
-                opts[part[0]] = part[1:].lstrip(": ").strip()
+
+        # Option lines: "A something", "B something", etc.
+        if stem is not None:
+            m_opt = re.match(r"^([A-E])\s*[:\.]?\s*(.+)$", t)
+            if m_opt:
+                opts[m_opt.group(1)] = m_opt.group(2).strip()
+                continue
+            # Fallback: if line looks like option but no letter, ignore
+
+    _save()
     return questions
 
 
@@ -856,7 +937,7 @@ def extract_images(docx_path, out_dir):
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 
-def preflight_check(questions, img_paths):
+def preflight_check(questions, img_paths, confirm=True):
     print("\n" + "=" * 60)
     print("PRE-FLIGHT CHECK")
     print("=" * 60)
@@ -878,8 +959,8 @@ def preflight_check(questions, img_paths):
     for q in questions:
         if q["content"] == "text" and not (q["question_text"] or "").strip():
             errors.append(f"  x Q{q['num']} has empty question text")
-        if not q["needs_manual"] and len(q["options"]) not in (4, 5):
-            errors.append(f"  x Q{q['num']} has {len(q['options'])} options (expected 5)")
+        if not q["needs_manual"] and len(q["options"]) not in (3, 4, 5):
+            errors.append(f"  x Q{q['num']} has {len(q['options'])} options (expected 3 or 5)")
 
     if errors:
         print("\n".join(errors))
@@ -912,6 +993,9 @@ def preflight_check(questions, img_paths):
     if manual:
         print(f"NOTE: Q{', Q'.join(map(str, manual))} need manual entry through the site's UI "
               f"and will be SKIPPED during upload (not created at all).\n")
+
+    if not confirm:
+        return True
 
     while True:
         ans = input("Proceed with upload? [y/n]: ").strip().lower()
@@ -1248,7 +1332,7 @@ async def main(args):
                 q["_img_no"] = img_idx + 1
                 img_idx += 1
 
-    if not preflight_check(questions, img_paths):
+    if not preflight_check(questions, img_paths, confirm=not args.dry_run):
         sys.exit(1)
 
     upload_qs = [q for q in questions if not q["needs_manual"]]

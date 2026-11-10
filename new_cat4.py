@@ -26,23 +26,38 @@ import sys
 from docx.oxml.ns import qn
 from playwright.async_api import async_playwright
 
+# Windows consoles default to cp1252/cp437, which can't print the ✓/✗/… glyphs
+# used throughout this script's output — force UTF-8 so it doesn't crash mid-run.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # ── User config — only change these two lines per paper ──────────────────────
-TOPIC     = "Figure Analysis"  # must match a key in CAT4_MAP below
-DOCX_PATH = r"C:\Users\angel\Documents\Exceptional Academics\CAT 4\CAT 4 SET 4\Figure Analysis.docx"
+TOPIC     = "Figure Recognition"  # must match a key in CAT4_MAP below
+DOCX_PATH = r"C:\Users\angel\Documents\Exceptional Academics\CAT 4\CAT 4 SET 5\Figure Recognition.docx"
 print(DOCX_PATH)
 print(os.path.exists(DOCX_PATH))
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Delay between uploads (seconds) — set both to 0 to disable ───────────────
 DELAY_MIN = 60   # 3 minutes
-DELAY_MAX = 120   # 5 minutes
+DELAY_MAX = 100   # 5 minutes
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOGIN_URL = "https://admin.11plusonline.co.uk/login"
 ADD_URL   = "https://admin.11plusonline.co.uk/question-bank/question/add"
 EMAIL     = "admin1@11plusonline.co.uk"
 PASSWORD  = "password1"
-IMG_DIR   = os.path.join(os.environ.get("TEMP", "/tmp"), "fig_upload_images")
+
+# NOTE: scoped per-TOPIC (not a shared constant) — every docx numbers its media
+# image1.png, image2.png, ... so if two topics' uploads ever run concurrently
+# (e.g. two terminals, to parallelize the slow DELAY_MIN/MAX wait between
+# questions), a shared folder means the second run's extract_media() wipe+
+# repopulate silently overwrites the first run's in-flight image files with a
+# DIFFERENT topic's content at the same filename — corrupting whichever
+# question is uploaded next in the first run. Scoping by topic makes that
+# impossible: concurrent runs for different topics simply can't collide.
+IMG_DIR   = os.path.join(os.environ.get("TEMP", "/tmp"), "fig_upload_images_" + re.sub(r"[^A-Za-z0-9]+", "_", TOPIC))
 
 # ── CAT4 map: TOPIC → (subject, site_topic, expected_count, content_type, imgs_per_q)
 #
@@ -91,30 +106,57 @@ def extract_instructions(doc) -> str:
 
     Older SET-3 docs have no heading/instructions block — they open straight at
     'EXAMPLE 1' or a numbered question — so return "" for those.
+
+    Some papers (e.g. Verbal Classification) repeat the topic-name heading a
+    SECOND time, right before the numbered "Q1." section (after the 2 practice
+    examples) — and only THAT occurrence is actually followed by the real
+    instructions sentence; the first occurrence at the very top just has the
+    heading with the examples starting immediately after, no instructions line
+    at all. So if the primary (paragraph 0/1) check comes up empty, fall back
+    to scanning the rest of the document for another heading-like line
+    (short, all-caps, matching TOPIC) immediately followed by a valid
+    instructions candidate.
     """
     nonempty = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     if len(nonempty) < 2:
         return ""
+
+    def is_junk(t: str) -> bool:
+        # Never mistake an answer/example/numbered line for instructions.
+        return bool(re.match(r"^(answer\b|example\b|\d+\s*[.)])", t, re.IGNORECASE))
+
     first = nonempty[0]
     # Old format: no topic heading, so there is no instructions paragraph.
-    if re.match(r"^example\b", first, re.IGNORECASE) or re.match(r"^\d+\s*[.)]", first):
+    if is_junk(first) or re.match(r"^\d+\s*[.)]", first):
         return ""
     cand = nonempty[1]
-    # Guard: never mistake an answer/example/numbered line for instructions.
-    if re.match(r"^(answer\b|example\b|\d+\s*[.)])", cand, re.IGNORECASE):
-        return ""
-    return cand
+    if not is_junk(cand):
+        return cand
+
+    # Fallback: look for a later repeated heading line (short, matches TOPIC
+    # case-insensitively) immediately followed by a real instructions line.
+    for i in range(2, len(nonempty) - 1):
+        line = nonempty[i]
+        if len(line) < 60 and line.strip().upper().rstrip(".") == TOPIC.upper():
+            nxt = nonempty[i + 1]
+            if not is_junk(nxt):
+                return nxt
+    return ""
 
 
 def parse_answer_table(doc) -> dict:
     """Answer key stored as a table [num | letter | explanation] (old SET-3 docs).
+
+    Some papers pad the table with blank spacer columns (e.g.
+    [num, '', letter, '', explanation]), so ignore empty cells entirely
+    rather than relying on fixed column indices.
 
     Returns {question_number: (letter, explanation)}.
     """
     key = {}
     for table in doc.tables:
         for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
             if (len(cells) >= 2
                     and re.match(r"^\d+$", cells[0])
                     and re.match(r"^[A-E]$", cells[1], re.IGNORECASE)):
@@ -157,17 +199,17 @@ def extract_media(doc, docx_path: str, out_dir: str) -> dict:
     return rid2path
 
 
-def para_images(par, rid2path: dict) -> list:
+def para_images(par, rid2path: dict, exclude_rids: set = frozenset()) -> list:
     """Extracted image paths anchored in this paragraph, in order."""
     out = []
     for blip in par._p.findall(".//" + BLIP):
         rid = blip.get(EMBED)
-        if rid and rid in rid2path:
+        if rid and rid in rid2path and rid not in exclude_rids:
             out.append(rid2path[rid])
     return out
 
 
-def body_image_paths(doc, rid2path: dict) -> list:
+def body_image_paths(doc, rid2path: dict, exclude_rids: set = frozenset()) -> list:
     """Every embedded image in whole-document (body) order.
 
     Some docs (e.g. SET-3 Figure Matrices) anchor a question's image to the
@@ -177,9 +219,28 @@ def body_image_paths(doc, rid2path: dict) -> list:
     out = []
     for blip in doc.element.body.findall(".//" + BLIP):
         rid = blip.get(EMBED)
-        if rid and rid in rid2path:
+        if rid and rid in rid2path and rid not in exclude_rids:
             out.append(rid2path[rid])
     return out
+
+
+def find_repeated_rids(doc, rid2path: dict) -> set:
+    """Relationship ids whose image is embedded more than once in the body.
+
+    Some papers copy-paste a small decorative graphic (e.g. an "A B C D E"
+    answer-option legend strip) above the answer row on many/most questions.
+    Unlike the real per-question diagram — which is embedded exactly once —
+    that decorative image's rId shows up over and over across the document.
+    Treating anything reused like that as noise (rather than as a genuine
+    per-question image) keeps it from displacing the real diagram when a
+    paragraph ends up with more than IMGS_PER_Q images anchored to it.
+    """
+    counts = {}
+    for blip in doc.element.body.findall(".//" + BLIP):
+        rid = blip.get(EMBED)
+        if rid and rid in rid2path:
+            counts[rid] = counts.get(rid, 0) + 1
+    return {rid for rid, c in counts.items() if c > 1}
 
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
@@ -230,6 +291,10 @@ def _parse_ans_text(t: str, q: dict):
 
 def _parse_image_docx(doc, path: str):
     rid2path = extract_media(doc, path, IMG_DIR)
+    repeated_rids = find_repeated_rids(doc, rid2path)
+    if repeated_rids:
+        names = ", ".join(sorted(os.path.basename(rid2path[r]) for r in repeated_rids))
+        print(f"  (ignoring {len(repeated_rids)} repeated decorative image(s): {names})")
 
     practice = []
     regular = {}
@@ -250,7 +315,7 @@ def _parse_image_docx(doc, path: str):
 
     for par in doc.paragraphs:
         t = par.text.strip()
-        imgs = para_images(par, rid2path)
+        imgs = para_images(par, rid2path, repeated_rids)
 
         # Skip any leading front-matter (topic-name heading + instructions
         # paragraph in SET-4 docs) until we reach the first EXAMPLE or the
@@ -276,7 +341,21 @@ def _parse_image_docx(doc, path: str):
             continue
 
         # ── numbered item (question or answer, depending on phase) ────────────
-        num_m = re.match(r"^(\d+)\s*[.)]", t) or re.match(r"^(\d+)\s+[A-Za-z]", t)
+        # Some docs glue the "ANSWERS" section header directly onto the first
+        # answer-key number with no separator at all (e.g. "ANSWERS1." as a
+        # single paragraph, instead of "ANSWERS" and "1." on separate lines
+        # like every other paper). Strip a leading "answer(s)" header token
+        # before testing for a leading number so that entry isn't swallowed
+        # into the header text and silently dropped.
+        t_num = re.sub(r"^answers?[:\.]?\s*", "", t, flags=re.IGNORECASE)
+        num_m = re.match(r"^(\d+)\s*[.)]", t_num) or re.match(r"^(\d+)\s+[A-Za-z]", t_num)
+        if not num_m and phase == "a":
+            # Answer-key entries are occasionally a bare number with no
+            # trailing "." or ")" at all (e.g. "7" where every other entry is
+            # "6.", "8.", ...). Only allow this once we're already in the
+            # answer-key phase, so a stray number can't be mistaken for a new
+            # question while still in the question section.
+            num_m = re.match(r"^(\d+)\s*$", t_num)
         if num_m:
             num = int(num_m.group(1))
             if phase == "q" and num <= last_qnum:
@@ -287,7 +366,7 @@ def _parse_image_docx(doc, path: str):
                 cur["images"] += imgs
             else:
                 cur = reg(num)
-                _parse_ans_line(t, cur)
+                _parse_ans_line(t_num, cur)
                 cur["images"] += imgs
             continue
 
@@ -316,17 +395,27 @@ def _parse_image_docx(doc, path: str):
             if expl and not q["explanation"]:
                 q["explanation"] = expl
 
-    # Prefer strict body-order image assignment when the image count is regular
-    # (every example + question has exactly IMGS_PER_Q images). This fixes docs
-    # whose drawings are anchored to the wrong paragraph. Falls back to the
-    # per-paragraph anchoring above when counts are irregular.
+    # Fall back to strict body-order image assignment ONLY when per-paragraph
+    # anchoring didn't already give every item exactly IMGS_PER_Q images. This
+    # fixes docs whose drawings are anchored to the wrong paragraph.
+    #
+    # IMPORTANT: don't apply this when anchoring already succeeded — naive
+    # sequential body-order pairing assumes each question's images are
+    # adjacent in the document, which is false whenever the answer key (with
+    # its own explanation images) is a separate block at the end of the paper
+    # (e.g. SET-4 Figure Recognition: 18 question images, THEN 18 explanation
+    # images). In that layout, per-paragraph anchoring — which matches images
+    # to their question by number, not by position — is the only correct
+    # method, so it must take priority.
     if IMGS_PER_Q:
         items = practice + regular_list          # document order (examples first)
-        seq = body_image_paths(doc, rid2path)
-        if len(seq) == len(items) * IMGS_PER_Q:
-            it = iter(seq)
-            for q in items:
-                q["images"] = [next(it) for _ in range(IMGS_PER_Q)]
+        anchored_ok = all(len(q["images"]) == IMGS_PER_Q for q in items)
+        if not anchored_ok:
+            seq = body_image_paths(doc, rid2path, repeated_rids)
+            if len(seq) == len(items) * IMGS_PER_Q:
+                it = iter(seq)
+                for q in items:
+                    q["images"] = [next(it) for _ in range(IMGS_PER_Q)]
 
     # image questions answer with A/B/C/D/E labels
     for q in practice + regular_list:
@@ -431,7 +520,8 @@ def _parse_text_docx(doc):
         )
         if is_header:
             header_idx = i
-            ak_text = "\n".join(paragraphs[i + 1:])
+            ak_lines = paragraphs[i + 1:]
+            ak_text = "\n".join(ak_lines)
             for line in ak_text.split("\n"):
                 m = re.match(r"Q(\d+)\.?\s+(?:correct answer:\s*)?([a-e])\)", line, re.IGNORECASE)
                 if m:
@@ -440,6 +530,21 @@ def _parse_text_docx(doc):
                     expl_m = re.search(r"[—–\u2212-]\s*(.+)", line)
                     expl = expl_m.group(1).strip().rstrip(".") if expl_m else ""
                     answer_key[num] = (letter, expl)
+
+            # Fallback: some papers (e.g. Verbal Classification) give the answer key
+            # as plain "<LETTER> – explanation" lines with NO "Qn." prefix at all —
+            # relying purely on sequential/positional order (1st line -> Q1, 2nd ->
+            # Q2, ...) instead of explicit numbering. The loop above can never match
+            # those, so if nothing was found, fall back to positional assignment.
+            if not answer_key:
+                num = 0
+                for line in ak_lines:
+                    m2 = re.match(r"^([A-E])\s*[—–\u2212-]\s*(.+)$", line.strip(), re.IGNORECASE)
+                    if m2:
+                        num += 1
+                        letter = m2.group(1).upper()
+                        expl = m2.group(2).strip().rstrip(".")
+                        answer_key[num] = (letter, expl)
             break
 
     regular = []
@@ -503,8 +608,10 @@ def preflight_check(practice, regular, instructions) -> bool:
         if CONTENT_TYPE == "image":
             if not q["images"]:
                 errors.append(f"  ✗ {q['label']} has no image")
-            elif IMGS_PER_Q == 2 and len(q["images"]) < 2:
-                warnings.append(f"  ! {q['label']} has {len(q['images'])} image(s), expected 2")
+            elif IMGS_PER_Q and len(q["images"]) != IMGS_PER_Q:
+                warnings.append(
+                    f"  ! {q['label']} has {len(q['images'])} image(s), expected {IMGS_PER_Q}"
+                )
         else:
             if not (q["question_text"] or "").strip():
                 errors.append(f"  ✗ {q['label']} has empty question text")
@@ -525,7 +632,8 @@ def preflight_check(practice, regular, instructions) -> bool:
     for q in all_qs:
         parts = [f"{q['label']:>4}", f"answer={q['answer']}"]
         if CONTENT_TYPE == "image":
-            parts.append(f"imgs={len(q['images'])}")
+            img_names = ", ".join(os.path.basename(p) for p in q["images"])
+            parts.append(f"imgs=[{img_names}]")
         else:
             parts.append(f"opts={q['answer_options']}")
         if q.get("explanation"):
